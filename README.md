@@ -23,7 +23,7 @@
 [![AtomGit G-Star](https://img.shields.io/badge/AtomGit-G--Star-DA203E?style=flat)](https://atomgit.com/krillinai/OpenCreator)
 [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/KrillinAIJunxi)
 [![QQ Group](https://img.shields.io/badge/QQ-Join%20Group-12B7F5?logo=qq&logoColor=white)](https://qm.qq.com/q/kc2cNpQ42A)
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/3GwBGsjs8)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/wnzKcJntQ)
 
 [Highlights](#project-highlights) · [Creator Tools](#creator-tools) · [Skills](#skills) · [Examples](#examples) · [Quick Start](#quick-start) · [Desktop](#desktop) · [Docs](#documentation) · [Community](#community)
 
@@ -31,7 +31,7 @@
 
 ![OpenCreator Agent workspace](./docs/images/opencreator-home-en.png)
 
-## Project Overview <a href="https://www.open-creator.ai/"><img align="right" src="https://img.shields.io/badge/Without%20A%20Key%3F-Try%20Our%20Models-0284C7" alt="Without A Key? Try Our Models" /></a>
+## Project Overview <a href="https://www.open-creator.ai/"><img src="https://img.shields.io/badge/Without%20A%20Key%3F-Try%20Our%20Models-EA580C?style=for-the-badge" height="28" alt="Without A Key? Try Our Models" /></a>
 
 OpenCreator is built for individuals and teams who want to keep creative and development work running locally. Instead of reimplementing an Agent loop, it uses Codex CLI as the execution engine and adds a stable local Runtime, a visual workspace, and a Desktop host around it.
 
@@ -606,19 +606,6 @@ The root `README.md` is the canonical English document. Maintained translations 
 <p>GitHub users from <strong>at least 108 countries and regions</strong> have starred OpenCreator.</p>
 
 <img src="./docs/images/star-coverage-map.svg" alt="World map highlighting countries and regions with OpenCreator GitHub Stars" width="760" />
-
-### The Crew
-
-Each crew member is responsible for their area, including its standards, contribution reviews and merges, and community support.
-
-<table border="1" cellpadding="12">
-  <tr>
-    <td align="center" valign="middle" width="160" height="160"><img src="./docs/images/contributors/wulien.svg" width="64" height="64" alt="wulien avatar" /><br /><a href="https://github.com/wulien">wulien</a><br />Code &amp; Bug Fixes</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="./docs/images/contributors/xiaheyuan.svg" width="64" height="64" alt="xiaheyuan avatar" /><br /><a href="https://github.com/xiaheyuan">xiaheyuan</a><br />Design &amp; assets</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="./docs/images/contributors/krillinai.svg" width="64" height="64" alt="krillinai avatar" /><br /><a href="https://github.com/krillinai">krillinai</a><br />Skills &amp; Docs</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="./docs/images/contributors/hbxugang.svg" width="64" height="64" alt="hbxugang avatar" /><br /><a href="https://github.com/hbxugang">hbxugang</a><br />Enterprise deployment</td>
-  </tr>
-</table>
 
 ### Contributors
 

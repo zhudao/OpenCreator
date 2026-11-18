@@ -23,7 +23,7 @@
 [![AtomGit G-Star](https://img.shields.io/badge/AtomGit-G--Star-DA203E?style=flat)](https://atomgit.com/krillinai/OpenCreator)
 [![X](https://img.shields.io/badge/X-Follow-000000?logo=x&logoColor=white)](https://x.com/KrillinAIJunxi)
 [![QQ Group](https://img.shields.io/badge/QQ-Join%20Group-12B7F5?logo=qq&logoColor=white)](https://qm.qq.com/q/kc2cNpQ42A)
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/3GwBGsjs8)
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/wnzKcJntQ)
 
 [项目特色](#项目特色) · [创作工具](#创作工具) · [Skills](#skills-技能) · [案例](#案例展示) · [快速开始](#快速开始) · [Desktop](#desktop) · [文档](#文档) · [社区](#社区)
 
@@ -579,19 +579,6 @@ pnpm --filter @opencreator/daemon test -- test/smoke/real-codex-smoke.test.ts
 <p>来自<strong>至少 108 个国家和地区</strong>的 GitHub 用户为 OpenCreator 点亮了 Star。</p>
 
 <img src="../images/star-coverage-map.svg" alt="世界地图：标出有 GitHub 用户为 OpenCreator 点亮 Star 的国家和地区" width="760" />
-
-### 核心团队
-
-每位成员负责各自领域的规范、贡献审核与合并，以及社区支持。
-
-<table border="1" cellpadding="12">
-  <tr>
-    <td align="center" valign="middle" width="160" height="160"><img src="../images/contributors/wulien.svg" width="64" height="64" alt="wulien avatar" /><br /><a href="https://github.com/wulien">wulien</a><br />代码与问题修复</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="../images/contributors/xiaheyuan.svg" width="64" height="64" alt="xiaheyuan avatar" /><br /><a href="https://github.com/xiaheyuan">xiaheyuan</a><br />设计与素材</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="../images/contributors/krillinai.svg" width="64" height="64" alt="krillinai avatar" /><br /><a href="https://github.com/krillinai">krillinai</a><br />Skills 与文档</td>
-    <td align="center" valign="middle" width="160" height="160"><img src="../images/contributors/hbxugang.svg" width="64" height="64" alt="hbxugang avatar" /><br /><a href="https://github.com/hbxugang">hbxugang</a><br />企业级部署</td>
-  </tr>
-</table>
 
 ### 贡献者
 
