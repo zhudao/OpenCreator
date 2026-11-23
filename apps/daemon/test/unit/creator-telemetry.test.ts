@@ -2,7 +2,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Fastify from 'fastify';
-import { afterEach, describe, expect, it } from 'vitest';
+import Database from 'better-sqlite3';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createCreatorTelemetryOutbox } from '../../src/telemetry/outbox.js';
 import {
   createCreatorTelemetryEvent,
@@ -53,6 +54,147 @@ function event(eventId = '9d9dd73e-b27f-4f0f-a5ef-0f5763d04c1a'): CreatorTelemet
 }
 
 describe('creator telemetry outbox', () => {
+  it('keeps task start and failure events while a trace batch is being written', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'creator-task-trace-busy-'));
+    const db = openRuntimeDatabase(join(tempDir, 'app.sqlite'));
+    const outbox = createCreatorTelemetryOutbox(db);
+    const write = outbox.enqueueTrace;
+    let release = () => {};
+    const busy = new Promise<void>(resolve => { release = resolve; });
+    const enqueue = vi.spyOn(outbox, 'enqueueTrace').mockImplementationOnce(async events => {
+      await busy;
+      await write(events);
+    });
+    const sink = createCreatorTelemetrySink({ outbox, readAccount: () => account });
+    const previous = { id: 'previous-download', templateId: 'video-download' } as CreatorJob;
+    const job = { id: 'next-download', templateId: 'video-download', status: 'failed', revision: 3 } as CreatorJob;
+    const stage = { id: 'next-stage', stageId: 'download', executor: 'download', attempt: 1, progress: {}, errorCode: 'network_unavailable' } as CreatorStageRun;
+    try {
+      sink.taskStarted(previous);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      sink.taskStarted(job);
+      sink.traceStageStarted(job, stage);
+      sink.taskState(job);
+      sink.stageFinished(job, stage, job.templateId, 'failed');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(enqueue).toHaveBeenCalledTimes(1);
+      release();
+      await expect.poll(async () => (await outbox.listTrace()).filter(event => event.task_id === job.id).map(event => event.event_type)).toEqual([
+        'task_started', 'stage_started', 'task_state', 'stage_finished'
+      ]);
+    } finally {
+      release();
+      await Promise.allSettled(enqueue.mock.results.map(result => result.value));
+      await outbox.closeTrace();
+      db.close();
+    }
+  });
+
+  it.each(['video-download', 'transcription', 'image-generation', 'video-generation', 'smart-dubbing', 'auto-clip', 'stickman-video'])('scopes task lifecycle reporting to supported tasks: %s', async templateId => {
+    tempDir = mkdtempSync(join(tmpdir(), 'creator-task-lifecycle-'));
+    const db = openRuntimeDatabase(join(tempDir, 'app.sqlite'));
+    const outbox = createCreatorTelemetryOutbox(db);
+    const sink = createCreatorTelemetrySink({ outbox, readAccount: () => account });
+    const job = { id: 'fixture-job', templateId, status: 'failed', revision: 3 } as CreatorJob;
+    const stage = { id: 'fixture-stage', stageId: 'generate', executor: templateId, attempt: 1, progress: {}, errorCode: 'network_unavailable' } as CreatorStageRun;
+    try {
+      sink.taskStarted(job);
+      sink.traceStageStarted(job, stage);
+      sink.taskState(job);
+      sink.stageFinished(job, stage, templateId, 'failed');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const traces = await outbox.listTrace();
+      expect(outbox.list()).toHaveLength(1);
+      expect(traces.map(({ event_type, feature, outcome }) => [event_type, feature, outcome])).toEqual(templateId === 'stickman-video' ? [] : [
+        ['task_started', templateId, undefined], ['stage_started', templateId, undefined],
+        ['task_state', templateId, 'failed'], ['stage_finished', templateId, 'failed']
+      ]);
+    } finally {
+      await outbox.closeTrace();
+      db.close();
+    }
+  });
+
+  it('keeps the transcription position in a failed subtitle trace without adding a user message', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'creator-task-trace-subtitle-'));
+    const db = openRuntimeDatabase(join(tempDir, 'app.sqlite'));
+    const outbox = createCreatorTelemetryOutbox(db);
+    const sink = createCreatorTelemetrySink({ outbox, readAccount: () => account });
+    try {
+      sink.stageFinished({ id: 'creator_job_1', templateId: 'video-translation' } as CreatorJob, {
+        id: 'subtitle-attempt', stageId: 'subtitle', executor: 'krillinai', progress: {}, attempt: 1,
+        errorCode: 'audio_transcription_pending'
+      } as CreatorStageRun, 'video-translation', 'unknown', undefined, {
+        version: 1, operation: 'krillinai.subtitle', causes: [],
+        transcription: { segment_number: 2, attempt_number: 1 }
+      });
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const traces = await outbox.listTrace();
+      expect(traces).toHaveLength(1);
+      expect(traces[0]).toMatchObject({ event_type: 'stage_finished', outcome: 'unknown', attempt_id: 'subtitle-attempt',
+        failure: { diagnostic: { transcription: { segment_number: 2, attempt_number: 1 } } } });
+      expect(traces[0]?.failure).not.toHaveProperty('user_message');
+    } finally {
+      await outbox.closeTrace();
+      db.close();
+    }
+  });
+
+  it('reports the video translation launch and preflight rejection separately from legacy stage events', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'creator-task-trace-'));
+    const db = openRuntimeDatabase(join(tempDir, 'app.sqlite'));
+    const outbox = createCreatorTelemetryOutbox(db);
+    let snapshot: { auth_state: 'signed_in' | 'signed_out'; account_id?: string; payment_state?: 'recharged' } = {
+      auth_state: 'signed_in', account_id: 'fixture-account', payment_state: 'recharged'
+    };
+    const sink = createCreatorTelemetrySink({ outbox, readAccount: () => account, readStartAccount: () => snapshot });
+    const job = { id: 'creator_job_1', templateId: 'video-translation', status: 'draft', revision: 0 } as CreatorJob;
+    sink.taskStarted(job);
+    snapshot = { auth_state: 'signed_out' };
+    sink.taskStarted(job);
+    sink.preflightRejected(job, 'subtitle', new CreatorExecutorError('creator_llm_config_missing', 'sensitive source URL'));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(outbox.list()).toEqual([]);
+    const traces = await outbox.listTrace();
+    expect(traces.map(trace => [trace.event_type, trace.stage_id, trace.code])).toEqual([
+      ['task_started', undefined, undefined],
+      ['preflight_rejected', 'subtitle', 'creator_llm_config_missing']
+    ]);
+    expect(traces[0]).toMatchObject({ auth_state: 'signed_in', account_id: 'fixture-account', payment_state: 'recharged' });
+    expect(traces[1]).not.toHaveProperty('account_id');
+    expect(JSON.stringify(traces)).not.toContain('sensitive');
+    await outbox.closeTrace();
+    expect(await outbox.listTrace()).toEqual(traces);
+    await outbox.closeTrace();
+    db.close();
+    expect(() => sink.taskStarted(job)).not.toThrow();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  });
+
+  it('reports only a source category for video translation launches', async () => {
+    const enqueueTrace = vi.fn<ReturnType<typeof createCreatorTelemetryOutbox>['enqueueTrace']>(async () => {});
+    const sink = createCreatorTelemetrySink({ outbox: { enqueueTrace } as unknown as ReturnType<typeof createCreatorTelemetryOutbox>, readAccount: () => account });
+    const cases = [
+      ['video-translation', 'file', 'https://www.youtube.com/watch?v=private-video', 'upload'],
+      ['video-translation', 'subtitle', '', 'subtitle'],
+      ['video-translation', 'url', 'https://youtu.be/private-video', 'youtube'],
+      ['video-translation', 'url', 'https://b23.tv/private-video', 'bilibili'],
+      ['video-translation', 'url', '分享视频 https://v.douyin.com/private-video/ 复制打开抖音', 'douyin'],
+      ['video-translation', 'url', 'https://example.test/private-video?token=private-token', 'other_link'],
+      ['video-translation', 'url', '/tmp/private-video.mp4', undefined],
+      ['video-download', 'url', 'https://youtu.be/private-video', undefined]
+    ] as const;
+    for (const [index, [templateId, sourceType, sourceUrl]] of cases.entries()) {
+      sink.taskStarted({ id: `source-job-${index}`, projectId: 'project_1', templateId, templateVersion: 2, status: 'draft', revision: 0,
+        state: { sourceType, sourceUrl, sourceFileName: 'private-video.mp4' }, agentThreadId: null,
+        stages: [], artifacts: [], providerRequests: [], activities: [], createdAt: '2026-11-20T00:00:00Z', updatedAt: '2026-11-20T00:00:00Z' });
+    }
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const traces = enqueueTrace.mock.calls[0]?.[0];
+    expect(traces?.map(trace => trace.translation_source)).toEqual(cases.map(([, , , expected]) => expected));
+    expect(JSON.stringify(traces)).not.toMatch(/private-|youtu\.be|b23\.tv/);
+  });
+
   it('persists, deduplicates, bounds and acknowledges events', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'creator-telemetry-outbox-'));
     const path = join(tempDir, 'app.sqlite');
@@ -84,6 +226,44 @@ describe('creator telemetry outbox', () => {
       await app.close();
       db.close();
     });
+  });
+
+  it('keeps the task collector isolated from a locked trace database and the legacy outbox', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'creator-task-trace-lock-'));
+    const path = join(tempDir, 'app.sqlite');
+    const db = openRuntimeDatabase(path);
+    const outbox = createCreatorTelemetryOutbox(db);
+    const sink = createCreatorTelemetrySink({ outbox, readAccount: () => account });
+    const app = Fastify();
+    await registerTelemetryRoutes(app, outbox, sink);
+    const trace = { event_id: 'c5a6e39d-383e-4a24-bfba-5563a6b72dd1', event_type: 'task_started' as const,
+      occurred_at: new Date().toISOString(), task_id: 'creator_job_1', feature: 'video-translation' };
+    try {
+      outbox.enqueue(event(trace.event_id), 'fixture');
+      await outbox.enqueueTrace([trace]);
+      const lock = new Database(`${path}.task-trace`, { timeout: 0 });
+      try {
+        lock.exec('BEGIN EXCLUSIVE');
+        const pulled = await app.inject('/telemetry/task-events');
+        expect(pulled.statusCode).toBe(200);
+        expect(pulled.json()).toEqual({ events: [] });
+        expect(outbox.count()).toBe(1);
+      } finally {
+        lock.close();
+      }
+      expect((await app.inject('/telemetry/task-events')).json()).toEqual({ events: [trace] });
+      const ack = await app.inject({ method: 'POST', url: '/telemetry/task-events/ack', payload: { event_ids: [trace.event_id] } });
+      expect(ack.json()).toEqual({ acknowledged: 1 });
+      expect(outbox.count()).toBe(1);
+      await outbox.enqueueTrace([trace]);
+      await app.inject({ method: 'POST', url: '/telemetry/enabled', payload: { enabled: false } });
+      expect((await app.inject('/telemetry/task-events')).json()).toEqual({ events: [] });
+      expect(await outbox.listTrace()).toEqual([]);
+    } finally {
+      await app.close();
+      await outbox.closeTrace();
+      db.close();
+    }
   });
 
   it('drops events outside the server acceptance window before reporting', async () => {

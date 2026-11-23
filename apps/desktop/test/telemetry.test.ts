@@ -83,6 +83,64 @@ function daemonEvent() {
 }
 
 describe('desktop telemetry', () => {
+  it('records both observed login states on a day with activity but without another launch', () => {
+    const memory = memoryPersistence();
+    const store = createTelemetryStore('/virtual/telemetry.json', memory.persistence);
+    store.incrementLaunch('2026-11-18');
+    store.incrementActiveMinute('2026-11-19');
+    store.observeAuth('2026-11-19', 'signed_out');
+    store.observeAuth('2026-11-19', 'signed_in');
+    expect(store.readDays('2026-11-19')).toEqual([
+      { date: '2026-11-18', launchCount: 1, activeMinutes: 0 },
+      { date: '2026-11-19', launchCount: 0, activeMinutes: 1, seenSignedOut: true, seenSignedIn: true }
+    ]);
+  });
+
+  it('sends daily reports without the new fields when an older server rejects them', async () => {
+    const reports: Array<Record<string, unknown>> = [];
+    const memory = memoryPersistence(JSON.stringify({ days: [{ date: '2026-11-19', launchCount: 1, activeMinutes: 1, seenSignedIn: true }] }));
+    const controller = startDesktopTelemetry({
+      path: '/virtual/telemetry.json', settings: memorySettings(), logger: logger(), appVersion: '3.3.4',
+      isOfficialBuild: false, endpointOverride: 'http://127.0.0.1:8790/api/v1/public/desktop-usage', isWindowActive: () => false,
+      now: () => new Date('2026-11-19T02:00:00.000Z'), persistence: memory.persistence,
+      fetchImpl: async (_url, init) => {
+        const report = JSON.parse(String(init?.body));
+        reports.push(report);
+        return Response.json({ error: report.seen_signed_in ? 1001 : 0 });
+      }
+    });
+    try {
+      await vi.waitFor(() => expect(reports).toHaveLength(2));
+      expect(reports[0]).toMatchObject({ seen_signed_in: true, launch_count: 2 });
+      expect(reports[1]).not.toHaveProperty('seen_signed_in');
+      expect(reports[1]).toMatchObject({ launch_count: 2 });
+    } finally {
+      controller.dispose();
+    }
+  });
+
+  it('keeps reporting launches when an older server cannot accept an activity-only day', async () => {
+    const reports: Array<{ usage_date: string; launch_count: number }> = [];
+    const memory = memoryPersistence(JSON.stringify({ days: [{ date: '2026-11-18', launchCount: 0, activeMinutes: 1 }] }));
+    const controller = startDesktopTelemetry({
+      path: '/virtual/telemetry.json', settings: memorySettings(), logger: logger(), appVersion: '3.3.4',
+      isOfficialBuild: false, endpointOverride: 'http://127.0.0.1:8790/api/v1/public/desktop-usage', isWindowActive: () => false,
+      now: () => new Date('2026-11-19T02:00:00.000Z'), persistence: memory.persistence,
+      fetchImpl: async (_url, init) => {
+        const report = JSON.parse(String(init?.body));
+        reports.push(report);
+        return Response.json({ error: report.launch_count === 0 ? 1001 : 0 });
+      }
+    });
+    try {
+      await controller.reportNow();
+      expect(reports).toContainEqual(expect.objectContaining({ usage_date: '2026-11-19', launch_count: 1 }));
+      expect(memory.read()).toContain('2026-11-18');
+    } finally {
+      controller.dispose();
+    }
+  });
+
   it('keeps daily launch and active-minute counters', () => {
     const memory = memoryPersistence();
     const store = createTelemetryStore(
@@ -529,6 +587,92 @@ describe('desktop telemetry', () => {
     await controller.reportNow();
     controller.dispose();
     expect(acknowledgments).toBe(1);
+  });
+
+  it('resends task events after HTTP rejection and timeout, and acknowledges only the delivered subset', async () => {
+    const deliveredID = '821526e6-e9a7-4c91-8ec4-72e869673511';
+    const pendingID = '821526e6-e9a7-4c91-8ec4-72e869673512';
+    const sent: string[][] = [];
+    const acknowledgments: string[][] = [];
+    let accepted = false;
+    let timedOut = false;
+    const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(() => nativeTimeout(30));
+    const controller = startDesktopTelemetry({
+      path: '/virtual/telemetry.json', settings: memorySettings(), logger: logger(), appVersion: '3.3.3',
+      isOfficialBuild: false, endpointOverride: 'http://127.0.0.1:8790/api/v1/public/desktop-usage',
+      getDaemonConnection: () => ({ address: 'http://127.0.0.1:31234', token: 'local-token' }),
+      isWindowActive: () => false, eventReportIntervalMs: 10, persistence: memoryPersistence().persistence,
+      fetchImpl: async (url, request) => {
+        const target = String(url);
+        if (target === 'http://127.0.0.1:31234/telemetry/task-events') {
+          return Response.json({ events: [deliveredID, pendingID].map(event_id => ({ event_id })) });
+        }
+        if (target.endsWith('/telemetry/task-events/ack')) {
+          acknowledgments.push(JSON.parse(String(request?.body)).event_ids);
+          return Response.json({ acknowledged: 1 });
+        }
+        if (target.endsWith('/desktop-usage/task-events')) {
+          expect(new Headers(request?.headers).has('Authorization')).toBe(false);
+          sent.push(JSON.parse(String(request?.body)).events.map((event: { event_id: string }) => event.event_id));
+          if (sent.length === 1) return Response.json({}, { status: 503 });
+          if (!accepted) {
+            const signal = request?.signal;
+            if (!signal) throw new Error('Missing request timeout');
+            return new Promise<Response>((_resolve, reject) => {
+              signal.addEventListener('abort', () => {
+                timedOut = true;
+                reject(signal.reason);
+              }, { once: true });
+            });
+          }
+          return Response.json({ error: 0, data: { acknowledged_event_ids: [deliveredID, 'not-from-this-batch'] } });
+        }
+        return Response.json({});
+      }
+    });
+    try {
+      await vi.waitFor(() => expect(timedOut).toBe(true));
+      expect(acknowledgments).toEqual([]);
+      accepted = true;
+      await vi.waitFor(() => expect(acknowledgments.length).toBeGreaterThan(0));
+      expect(sent.every(ids => ids.join(',') === `${deliveredID},${pendingID}`)).toBe(true);
+      expect(acknowledgments.every(ids => ids.length === 1 && ids[0] === deliveredID)).toBe(true);
+    } finally {
+      controller.dispose();
+      timeout.mockRestore();
+    }
+  });
+
+  it('keeps sending task events when an older receiver rejects the translation source field', async () => {
+    const eventId = '821526e6-e9a7-4c91-8ec4-72e869673511';
+    const event = { event_id: eventId, event_type: 'task_started', translation_source: 'youtube' };
+    const payloads: unknown[] = [];
+    const acknowledgments: unknown[] = [];
+    const controller = startDesktopTelemetry({
+      path: '/virtual/telemetry.json', settings: memorySettings(), logger: logger(), appVersion: '3.3.3',
+      isOfficialBuild: false, endpointOverride: 'http://127.0.0.1:8790/api/v1/public/desktop-usage',
+      getDaemonConnection: () => ({ address: 'http://127.0.0.1:31234', token: 'local-token' }),
+      isWindowActive: () => false, eventReportIntervalMs: 10, persistence: memoryPersistence().persistence,
+      fetchImpl: async (url, request) => {
+        const target = String(url);
+        if (target.endsWith('/telemetry/task-events')) return Response.json({ events: acknowledgments.length ? [] : [event] });
+        if (target.endsWith('/telemetry/task-events/ack')) acknowledgments.push(JSON.parse(String(request?.body)).event_ids);
+        if (target.endsWith('/desktop-usage/task-events')) {
+          const events = JSON.parse(String(request?.body)).events;
+          payloads.push(events);
+          if (Object.hasOwn(events[0], 'translation_source')) return Response.json({}, { status: 400 });
+          return Response.json({ error: 0, data: { acknowledged_event_ids: [eventId] } });
+        }
+        return Response.json({});
+      }
+    });
+    try {
+      await vi.waitFor(() => expect(acknowledgments).toEqual([[eventId]]));
+      expect(payloads).toEqual([[event], [{ event_id: eventId, event_type: 'task_started' }]]);
+    } finally {
+      controller.dispose();
+    }
   });
 
   it('does not pull or deliver daemon events while disabled', async () => {

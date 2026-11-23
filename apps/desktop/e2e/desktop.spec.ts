@@ -52,6 +52,7 @@ const fakeCodexLauncherSource = join(e2eDir, 'fixtures', 'fake-codex-launcher.go
 test.describe.configure({ mode: 'serial' });
 
 test('@package-smoke 字幕转录余额不足时不自动重试，充值后手动重试产出字幕', async ({}, testInfo) => {
+  test.setTimeout(210_000);
   const account = { id: 'subtitle-test', email: 'subtitle@example.test', verified: true };
   const models = [
     { id: 'deepseek-v4-flash', modality: 'text' as const, capabilities: ['chat', 'responses'] },
@@ -61,6 +62,10 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
   let funded = false;
   let translations = 0;
   const submissions: Array<{ key: string; audio: boolean; funded: boolean }> = [];
+  const transcriptionCallIds: string[] = [];
+  const rejectedTraceEvents: Array<Record<string, unknown>> = [];
+  const acceptedTraceIDs = new Set<unknown>();
+  let telemetryAvailable = false;
   const sourceText = 'Hello world.';
   const targetText = '你好，世界。';
   const gateway = createServer(async (request, response) => {
@@ -74,6 +79,7 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
     const payload = Buffer.concat(chunks).toString('utf8');
     if (path === '/v1/audio/transcriptions' && request.method === 'POST') {
       const key = String(request.headers['idempotency-key'] ?? '');
+      transcriptionCallIds.push(String(request.headers['x-oc-call-id'] ?? ''));
       submissions.push({ key, audio: payload.includes('name="file"') && payload.includes('whisper-1'), funded });
       if (!funded) return response.writeHead(402).end(JSON.stringify({ error: { code: 'credits_insufficient', message: 'Insufficient credits' } }));
       const id = `ocreq_${createHash('sha256').update(`${account.id}:${key}`).digest('hex').slice(0, 48)}`;
@@ -97,6 +103,17 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
           segments: [{ source: sentence.text, target: targetText }] })) });
       } else return response.writeHead(400).end(JSON.stringify({ error: { code: 'unexpected_fixture_prompt' } }));
       return response.end(JSON.stringify({ id: 'subtitle-test-translation', choices: [{ finish_reason: 'stop', message: { role: 'assistant', content } }] }));
+    }
+    if (path === '/telemetry/task-events' && request.method === 'POST') {
+      const { events } = JSON.parse(payload) as { events: Array<Record<string, unknown>> };
+      if (!telemetryAvailable) {
+        rejectedTraceEvents.push(...events);
+        request.socket.destroy();
+        return;
+      }
+      const ids = events.map(event => event.event_id);
+      ids.forEach(id => acceptedTraceIDs.add(id));
+      return response.end(JSON.stringify({ error: 0, data: { acknowledged_event_ids: ids } }));
     }
     if (path?.startsWith('/v1/requests/')) return response.writeHead(404).end(JSON.stringify({ error: { code: 'request_not_found' } }));
     return response.end(JSON.stringify({ items: [] }));
@@ -159,7 +176,18 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
     await expect(retry).toBeEnabled();
     expect(submissions).toEqual([{ key: expect.stringMatching(/^creator:/), audio: true, funded: false }]);
     expect(translations).toBe(0);
+    expect(transcriptionCallIds[0]).toMatch(/^[0-9a-f-]{36}$/);
+    const readTrace = async () => (await runtimeRequest<{ events: Array<Record<string, unknown>> }>(page, 'GET', '/telemetry/task-events')).body.events;
+    await expect.poll(readTrace).toEqual(expect.arrayContaining([
+      expect.objectContaining({ event_type: 'task_started', task_id: id }),
+      expect.objectContaining({ event_type: 'request_finished', task_id: id, call_id: transcriptionCallIds[0], http_status: 402 }),
+      expect.objectContaining({ event_type: 'stage_finished', task_id: id, attempt_id: failed.id, code: 'credits_insufficient' })
+    ]));
     await page.screenshot({ path: testInfo.outputPath('subtitle-credits-insufficient.png') });
+
+    const failedTrace = expect.objectContaining({ event_type: 'stage_finished', attempt_id: failed.id, code: 'credits_insufficient' });
+    await expect.poll(() => rejectedTraceEvents, { timeout: 70_000 }).toEqual(expect.arrayContaining([failedTrace]));
+    expect(await readTrace()).toEqual(expect.arrayContaining([failedTrace]));
 
     funded = true;
     await retry.click();
@@ -170,6 +198,7 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
     expect(submissions).toHaveLength(2);
     expect(submissions[1]).toMatchObject({ audio: true, funded: true });
     expect(submissions[1]?.key).not.toBe(submissions[0]?.key);
+    expect(transcriptionCallIds[1]).not.toBe(transcriptionCallIds[0]);
     expect(translations).toBeGreaterThan(0);
     for (const [kind, text] of [['source_subtitle', sourceText], ['target_subtitle', targetText], ['bilingual_subtitle', targetText]] as const) {
       const artifact = completed.artifacts?.find(candidate => candidate.kind === kind && candidate.status === 'completed');
@@ -182,6 +211,19 @@ test('@package-smoke 字幕转录余额不足时不自动重试，充值后手�
       expect(srt.text).toContain(text);
       expect(srt.text).toMatch(/\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}/);
     }
+    const taskEvents = async (activePage: Page) => (await runtimeRequest<{ events: Array<Record<string, unknown>> }>(activePage, 'GET', '/telemetry/task-events')).body.events.filter(event => event.task_id === id);
+    await expect.poll(() => taskEvents(page)).toEqual(expect.arrayContaining([failedTrace,
+      expect.objectContaining({ event_type: 'task_state', outcome: 'completed' })]));
+    const pendingIDs = (await taskEvents(page)).map(event => event.event_id);
+    const previous = fixture;
+    await closePackagedApp(previous);
+    fixture = { ...await relaunchPackagedApp(previous), root: previous.root, stateDir: previous.stateDir };
+    await waitForWorkspace(fixture.page);
+    expect((await taskEvents(fixture.page)).map(event => event.event_id)).toEqual(pendingIDs);
+    telemetryAvailable = true;
+    await expect.poll(() => pendingIDs.filter(id => !acceptedTraceIDs.has(id)), { timeout: 70_000 }).toEqual([]);
+    await expect.poll(() => taskEvents(fixture!.page)).toEqual([]);
+    expect(submissions).toHaveLength(2);
   } finally {
     if (fixture) await closeFixture(fixture);
     gateway.closeAllConnections();

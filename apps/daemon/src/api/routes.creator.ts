@@ -93,6 +93,8 @@ import type { CodexNativeImageRuntime } from '../image-generation/provider.js';
 import type { CreatorIssueService } from '../creator/issues.js';
 import { registerCreatorThumbnailRoutes } from './routes.creator-thumbnail.js';
 import { GatewayError } from '../gateway/client.js';
+import { CreatorGatewayNotReadyError } from '../gateway/creator-service-source.js';
+import type { CreatorTelemetrySink } from '../telemetry/creator.js';
 
 export async function registerCreatorRoutes(
   server: FastifyInstance,
@@ -112,6 +114,7 @@ export async function registerCreatorRoutes(
     artifactImportService?: CreatorArtifactImportService;
     jobsRoot: string;
     dispatcher: CreatorCommandDispatcher;
+    telemetry?: CreatorTelemetrySink;
     preflight?: Pick<CreatorPreflight, 'check'>;
     stageRunner?: Pick<CreatorStageRunner, 'cancel' | 'cancelJob' | 'pauseDownload' | 'resumeDownload'>;
     presets?: CreatorPresetRegistry;
@@ -124,6 +127,18 @@ export async function registerCreatorRoutes(
     subtitleRenderService?: ReturnType<typeof createSubtitleRenderService>;
   }
 ): Promise<void> {
+  async function checkResumePreflight(...args: Parameters<CreatorPreflight['check']>) {
+    const [job, stage] = args;
+    options.telemetry?.taskStarted(job);
+    try {
+      const result = await options.preflight!.check(...args);
+      if (!result.canStart) throw new CreatorPreflightError(result);
+    } catch (error) {
+      options.telemetry?.preflightRejected(job, stage.id, error, error instanceof CreatorPreflightError ? error.result.blocked : undefined);
+      throw error;
+    }
+  }
+
   await registerCreatorThumbnailRoutes(server, service, options.readServicesConfig);
   server.post('/creator/subtitle-render/prepare', { bodyLimit: 16 * 1024 * 1024 }, async (request, reply) => {
     try {
@@ -539,23 +554,32 @@ export async function registerCreatorRoutes(
     }))
   }));
 
-  server.get<{ Params: { id: string }; Querystring: { stageId?: string; inputResultVersion?: string } }>(
+  server.get<{ Params: { id: string }; Querystring: { stageId?: string; inputResultVersion?: string; launch?: string } }>(
     '/creator/jobs/:id/preflight',
     async (request, reply) => {
+      let launchJob: CreatorJob | undefined;
       try {
         const job = requireCreatorJob(service, request.params.id);
+        if (request.query.launch === '1') {
+          launchJob = job;
+          options.telemetry?.taskStarted(job);
+        }
         if (options.preflight === undefined) {
+          if (launchJob) options.telemetry?.preflightRejected(launchJob, request.query.stageId ?? 'unknown', { code: 'creator_preflight_unavailable' });
           return reply.code(503).send(apiError('creator_preflight_unavailable' as RuntimeErrorCode, 'Creator preflight is unavailable'));
         }
         const stageId = readString(request.query.stageId, 'stageId');
         const stage = service.templates.get(job.templateId, job.templateVersion).stages.find(candidate => candidate.id === stageId);
         if (stage === undefined) throw new CreatorServiceError('creator_stage_not_found', 'Creator stage was not found');
-        return options.preflight.check(job, stage, {
+        const result = await options.preflight.check(job, stage, {
           ...(request.query.inputResultVersion === undefined
             ? {}
             : { inputResultVersion: readQueryInteger(request.query.inputResultVersion, 'inputResultVersion') })
         });
+        if (launchJob && !result.canStart) options.telemetry?.preflightRejected(launchJob, stageId, new CreatorPreflightError(result), result.blocked);
+        return result;
       } catch (error) {
+        if (launchJob) options.telemetry?.preflightRejected(launchJob, request.query.stageId ?? 'unknown', error);
         return sendCreatorError(reply, error, {
           jobId: request.params.id,
           source: 'preflight',
@@ -751,8 +775,7 @@ export async function registerCreatorRoutes(
         }
         const definition = service.templates.get(job.templateId, job.templateVersion).stages.find(stage => stage.id === 'download')!;
         if (options.preflight) {
-          const preflight = await options.preflight.check(job, definition);
-          if (!preflight.canStart) throw new CreatorPreflightError(preflight);
+          await checkResumePreflight(job, definition);
         }
         job = requireCreatorJob(service, id);
         const result = options.dispatcher.dispatch(id, {
@@ -850,12 +873,11 @@ export async function registerCreatorRoutes(
       if (options.preflight !== undefined) {
         const stage = service.templates.get(job.templateId, job.templateVersion).stages.find(candidate => candidate.id === latest.stageId);
         if (stage === undefined) throw new CreatorServiceError('creator_stage_not_found', 'Creator stage was not found');
-        const preflight = await options.preflight.check(job, stage, {
+        await checkResumePreflight(job, stage, {
           ...(typeof latest.progress.inputResultVersion === 'number'
             ? { inputResultVersion: latest.progress.inputResultVersion }
             : {})
         });
-        if (!preflight.canStart) throw new CreatorPreflightError(preflight);
       }
       if (job.templateId === 'video-translation' && options.videoTranslationWorkflow !== undefined) {
         try {
@@ -1001,6 +1023,7 @@ export async function registerCreatorRoutes(
 
   server.post<{ Body: unknown }>('/creator/jobs/:id/actions', async (request, reply) => {
     const { id } = request.params as { id: string };
+    let preflightTrace: { job: CreatorJob; stageId: string } | undefined;
     try {
       const body = readObject(request.body);
       const action = readString(body.action, 'action');
@@ -1008,6 +1031,10 @@ export async function registerCreatorRoutes(
       const jobBeforeAction = service.getJob(id);
       if (jobBeforeAction === undefined) {
         throw new CreatorServiceError('creator_job_not_found', 'Creator job not found');
+      }
+      if ((action === 'run-stage' || action === 'retry-stage') && typeof actionInput.stageId === 'string') {
+        preflightTrace = { job: jobBeforeAction, stageId: actionInput.stageId };
+        options.telemetry?.taskStarted(jobBeforeAction);
       }
       if (
         (action === 'run-stage' || action === 'retry-stage')
@@ -1097,6 +1124,7 @@ export async function registerCreatorRoutes(
           throw error;
         }
       }
+      preflightTrace = undefined;
       const expectedRevision = readInteger(body.expectedRevision, 'expectedRevision');
       const result = await options.dispatcher.dispatchAsync(id, {
         idempotencyKey: typeof body.idempotencyKey === 'string'
@@ -1141,10 +1169,13 @@ export async function registerCreatorRoutes(
       }
       return result;
     } catch (error) {
+      if (preflightTrace) options.telemetry?.preflightRejected(preflightTrace.job, preflightTrace.stageId, error,
+        error instanceof CreatorPreflightError ? error.result.blocked : undefined);
       return sendCreatorError(reply, error, {
         jobId: id,
-        source: error instanceof CreatorPreflightError ? 'preflight' : 'api',
+        source: error instanceof CreatorPreflightError || error instanceof CreatorGatewayNotReadyError ? 'preflight' : 'api',
         operation: 'creator.action',
+        stageId: preflightTrace?.stageId,
         service,
         issueService: options.issueService
       });
@@ -1514,7 +1545,7 @@ function sendCreatorError(reply: FastifyReply, error: unknown, context?: Creator
   if (error instanceof CreatorPreflightError) {
     return reply.code(400).send({
       error: {
-        ...response(error.code as RuntimeErrorCode, error.message).error,
+        ...response(error.code as RuntimeErrorCode, error.message, { preflight: error.result }).error,
         preflight: error.result
       }
     });
@@ -1582,6 +1613,9 @@ function sendCreatorError(reply: FastifyReply, error: unknown, context?: Creator
       'OpenCreator sign-in has expired. Sign in again before retrying.',
       undefined
     ));
+  }
+  if (error instanceof CreatorGatewayNotReadyError) {
+    return reply.code(503).send(response('GATEWAY_SERVICES_NOT_READY', error.message));
   }
   if (error instanceof ZodError || error instanceof TypeError) {
     return reply.code(400).send(response('VALIDATION_FAILED', error.message));

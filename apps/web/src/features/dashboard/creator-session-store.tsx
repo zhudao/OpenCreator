@@ -63,7 +63,7 @@ export type CreatorSessionContextValue = {
   focusIssue(issue: OpenCreatorIssue | null): void;
   askPendingIssue(question: string, issue: OpenCreatorIssue): void;
   applyRemoteSnapshot(job: CreatorJob): void;
-  applyAction(request: Omit<CreatorActionRequest, 'expectedRevision'>): Promise<CreatorJob>;
+  applyAction(request: Omit<CreatorActionRequest, 'expectedRevision'>, options?: { serverPreflight?: boolean }): Promise<CreatorJob>;
   cancelJob(): Promise<void>;
   resumeJob(): Promise<void>;
   controlDownload?(stageRunId: string, action: 'pause' | 'resume' | 'cancel'): Promise<void>;
@@ -482,7 +482,7 @@ export function CreatorSessionProvider(props: {
     props.onAskPendingIssue(issue, question);
   }, [props.onAskPendingIssue]);
 
-  const runPreflight = useCallback(async (stageId: string, options?: { inputResultVersion?: number }) => {
+  const runPreflight = useCallback(async (stageId: string, options?: { inputResultVersion?: number; launch?: boolean }) => {
     if (props.service.preflight === undefined) {
       const cause = new Error('Creator preflight is unavailable');
       captureCreatorFailure('creator.preflight', cause, 'Preflight checks are unavailable. Try again later.', 'preflight');
@@ -491,7 +491,7 @@ export function CreatorSessionProvider(props: {
     await flush();
     await ensurePersistedJob();
     try {
-      const result = options?.inputResultVersion === undefined
+      const result = options?.inputResultVersion === undefined && !options?.launch
         ? await props.service.preflight(confirmedRef.current.id, stageId)
         : await props.service.preflight(confirmedRef.current.id, stageId, options);
       setPreflight(result);
@@ -643,17 +643,20 @@ export function CreatorSessionProvider(props: {
   }, [confirmedJob.id, props.service, reloadAgentTimeline]);
 
   const applyAction = useCallback(async (
-    request: Omit<CreatorActionRequest, 'expectedRevision'>
+    request: Omit<CreatorActionRequest, 'expectedRevision'>,
+    options?: { serverPreflight?: boolean }
   ) => {
     let requestRevision = confirmedRef.current.revision;
     try {
       await flush();
       await ensurePersistedJob();
       requestRevision = confirmedRef.current.revision;
-      if (request.action === 'run-stage' && props.service.preflight !== undefined) {
+      if (request.action === 'run-stage' && !options?.serverPreflight && props.service.preflight !== undefined) {
         const stageId = request.input.stageId;
-        if (typeof stageId === 'string') await runPreflight(stageId,
-          typeof request.input.inputResultVersion === 'number' ? { inputResultVersion: request.input.inputResultVersion } : undefined);
+        if (typeof stageId === 'string') await runPreflight(stageId, {
+          launch: true,
+          ...(typeof request.input.inputResultVersion === 'number' ? { inputResultVersion: request.input.inputResultVersion } : {})
+        });
       }
       const response = await props.service.applyAction(confirmedRef.current.id, {
         ...request,
@@ -663,6 +666,8 @@ export function CreatorSessionProvider(props: {
       setError(null);
       return confirmedRef.current;
     } catch (cause) {
+      const blocked = (cause as { details?: { preflight?: CreatorPreflightResponse } } | null)?.details?.preflight;
+      if (options?.serverPreflight && blocked?.canStart === false && Array.isArray(blocked.blocked)) setPreflight(blocked);
       const nextError = toSessionError(cause);
       if (!isSupersededRevisionConflict(cause, requestRevision, confirmedRef.current.revision)) {
         setError(nextError);

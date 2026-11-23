@@ -5,13 +5,13 @@ import type {
   CreatorJson,
   CreatorServicesConfig
 } from '@opencreator/protocol';
-import { gatewayModelIdMatches, gatewayTranslationFlashModel, normalizeSubtitleRenderCues, type SubtitleRenderCueInput } from '@opencreator/protocol';
+import { gatewayModelIdMatches, gatewayTranslationFlashModel, normalizeSubtitleRenderCues, openCreatorLanguages, type SubtitleRenderCueInput } from '@opencreator/protocol';
 import type { CreatorExecutorInput } from '../executor.js';
 import { CreatorExecutorError } from '../executor.js';
 import { sha256CreatorFile } from '../file-hash.js';
 import { publicErrorKindForCode, sanitizePublicErrorFacts, type PublicErrorFacts } from '@opencreator/protocol';
 import { spawnCreatorProcess } from '../process-tree.js';
-import { attachFailureDiagnostic, processFailureDiagnostic } from '../../telemetry/diagnostic.js';
+import { attachFailureDiagnostic, processFailureDiagnostic, sanitizeFailureDiagnostic } from '../../telemetry/diagnostic.js';
 import { createKrillinConfigToml } from './config-bridge.js';
 import { dubbingSegmentCacheDir } from './dubbing-resume.js';
 import { gatewayCreatorBinding } from '../../gateway/creator-service-source.js';
@@ -66,6 +66,7 @@ type KrillinCliResponse = {
     http_status?: number;
     upstream_code?: string;
     request_id?: string;
+    transcription?: unknown;
   };
 };
 
@@ -265,6 +266,7 @@ export async function runKrillinCli(input: RunKrillinCliInput): Promise<KrillinR
         ytDlpRuntime: input.ytDlpRuntime,
         nlpPython: resolveKrillinNlpPython(input.resourceRoot, input.manifest),
         dubbingCacheDir,
+        clipReasonLocale: args[0] === 'clip' ? openCreatorLanguages.find(locale => locale === input.options.reasonLocale) : undefined,
         reportProgress: progress => input.stage.reportProgress(progress),
         signal: input.stage.signal
       });
@@ -493,6 +495,7 @@ function executeCli(input: {
   ytDlpRuntime?: YtDlpRuntime;
   nlpPython?: string;
   dubbingCacheDir?: string;
+  clipReasonLocale?: string;
   reportProgress(progress: Record<string, CreatorJson>): void;
   signal: AbortSignal;
 }): Promise<KrillinCliResponse> {
@@ -503,7 +506,8 @@ function executeCli(input: {
       env: {
         ...createKrillinCliEnvironment(process.env, input.runtimeBin, input.resourceRoot,
           input.dependencyBin, input.ytDlpRuntime, input.nlpPython),
-        OPENCREATOR_KRILLIN_DUBBING_CACHE: input.dubbingCacheDir
+        OPENCREATOR_KRILLIN_DUBBING_CACHE: input.dubbingCacheDir,
+        OPENCREATOR_CLIP_REASON_LOCALE: input.clipReasonLocale
       },
       stdio: ['ignore', 'pipe', 'pipe']
     }, input.signal);
@@ -545,6 +549,8 @@ function executeCli(input: {
         return;
       }
       if (response.ok !== true || code !== 0) {
+        const facts = diagnostic(`${stderr}\n${response.error?.message ?? ''}`, code);
+        const transcription = input.operation === 'krillinai.subtitle' ? response.error?.transcription : undefined;
         reject(attachFailureDiagnostic(new KrillinCliError(
           response.error?.code ?? 'krillin_cli_failed',
           redact(response.error?.message ?? (stderr || 'KrillinAI CLI failed')),
@@ -552,7 +558,7 @@ function executeCli(input: {
           response.error?.retryable === true,
           undefined,
           response.error
-        ), diagnostic(`${stderr}\n${response.error?.message ?? ''}`, code)));
+        ), transcription === undefined ? facts : sanitizeFailureDiagnostic({ ...facts, transcription }) ?? facts));
         return;
       }
       resolvePromise(response);
@@ -678,6 +684,8 @@ async function collectArtifacts(
       if (!info.isFile() || info.size === 0) {
         throw new CreatorExecutorError('krillin_output_invalid', 'Clip output is empty');
       }
+      const durationMs = (clip.end_ms as number) - (clip.start_ms as number);
+      const selectionReason = readClipSelectionReason(clip.selection_reason, durationMs);
       result.push({
         id: `${input.stage.stageRun.id}:auto_clip_video:${clip.id}`,
         kind: 'auto_clip_video',
@@ -689,13 +697,25 @@ async function collectArtifacts(
           candidateId: clip.id,
           start: (clip.start_ms as number) / 1000,
           end: (clip.end_ms as number) / 1000,
-          duration: ((clip.end_ms as number) - (clip.start_ms as number)) / 1000,
-          score: clip.score
+          duration: durationMs / 1000,
+          score: clip.score,
+          ...(selectionReason === undefined ? {} : { selectionReason })
         }
       });
     }
   }
   return result;
+}
+
+function readClipSelectionReason(value: unknown, durationMs: number) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const { text, offset_ms: offsetMs, locale } = value as Record<string, unknown>;
+  const reasonLocale = openCreatorLanguages.find(language => language === locale);
+  if (typeof text !== 'string' || typeof offsetMs !== 'number' || !Number.isInteger(offsetMs)
+    || offsetMs < 0 || offsetMs >= durationMs || reasonLocale === undefined) return undefined;
+  const summary = text.trim();
+  if (!summary || Array.from(summary).length > 240) return undefined;
+  return { text: summary, offsetMs, locale: reasonLocale };
 }
 
 export function krillinTranslationReport(response: Pick<KrillinCliResponse, 'warnings' | 'translation_failures' | 'subtitle_quality'>): Record<string, CreatorJson> {
